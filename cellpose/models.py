@@ -8,6 +8,9 @@ import numpy as np
 from tqdm import trange, tqdm
 from urllib.parse import urlparse
 import torch
+from torch.cuda.amp import autocast
+from torch.nn.parallel import DataParallel
+import torch.nn.functional as F
 
 import logging
 
@@ -350,6 +353,12 @@ class CellposeModel():
 
         self.net_type = f"cellpose_{backbone}"
 
+        self.net = torch.jit.script(self.net)  # JIT compile the model
+        if torch.cuda.device_count() > 1:
+            self.net = DataParallel(self.net)
+        self.net.to(self.device)
+
+    @torch.no_grad()
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
@@ -447,13 +456,12 @@ class CellposeModel():
             return masks, flows, styles
 
         else:
-            # reshape image
             x = transforms.convert_image(x, channels, channel_axis=channel_axis,
-                                         z_axis=z_axis, do_3D=(do_3D or
-                                                               stitch_threshold > 0),
+                                         z_axis=z_axis, do_3D=(do_3D or stitch_threshold > 0),
                                          nchan=self.nchan)
+            x = torch.from_numpy(x).to(self.device)
             if x.ndim < 4:
-                x = x[np.newaxis, ...]
+                x = x.unsqueeze(0)
             
             if diameter is not None and diameter > 0:
                 rescale = self.diam_mean / diameter
@@ -461,16 +469,19 @@ class CellposeModel():
                 diameter = self.diam_labels
                 rescale = self.diam_mean / diameter
 
-            masks, styles, dP, cellprob, p = self._run_cp(
-                x, compute_masks=compute_masks, normalize=normalize, invert=invert,
-                rescale=rescale, resample=resample, augment=augment, tile=tile,
-                batch_size=batch_size, tile_overlap=tile_overlap, bsize=bsize, flow_threshold=flow_threshold,
-                cellprob_threshold=cellprob_threshold, interp=interp, min_size=min_size,
-                max_size_fraction=max_size_fraction, do_3D=do_3D, anisotropy=anisotropy, niter=niter,
-                stitch_threshold=stitch_threshold)
+            with autocast(enabled=self.gpu):
+                masks, styles, dP, cellprob, p = self._run_cp(
+                    x, compute_masks=compute_masks, normalize=normalize, invert=invert,
+                    rescale=rescale, resample=resample, augment=augment, tile=tile,
+                    batch_size=batch_size, tile_overlap=tile_overlap, bsize=bsize, 
+                    flow_threshold=flow_threshold, cellprob_threshold=cellprob_threshold, 
+                    interp=interp, min_size=min_size, max_size_fraction=max_size_fraction, 
+                    do_3D=do_3D, anisotropy=anisotropy, niter=niter, 
+                    stitch_threshold=stitch_threshold)
 
-            flows = [plot.dx_to_circ(dP), dP, cellprob, p]
-            return masks, flows, styles
+            flows = [plot.dx_to_circ(dP.cpu().numpy()), dP.cpu().numpy(), 
+                     cellprob.cpu().numpy(), p.cpu().numpy()]
+            return masks.cpu().numpy(), flows, styles.cpu().numpy()
 
     def _run_cp(self, x, compute_masks=True, normalize=True, invert=False, niter=None,
                 rescale=1.0, resample=True, augment=False, tile=True, 
@@ -478,7 +489,7 @@ class CellposeModel():
                 cellprob_threshold=0.0, bsize=224, flow_threshold=0.4, min_size=15,
                 max_size_fraction=0.4, interp=True, anisotropy=1.0, do_3D=False, 
                 stitch_threshold=0.0):
-
+        
         if isinstance(normalize, dict):
             normalize_params = {**normalize_default, **normalize}
         elif not isinstance(normalize, bool):
@@ -488,108 +499,41 @@ class CellposeModel():
             normalize_params["normalize"] = normalize
         normalize_params["invert"] = invert
 
-        tic = time.time()
-        shape = x.shape
-        nimg = shape[0]
-
-        bd, tr = None, None
-
-        # pre-normalize if 3D stack for stitching or do_3D
-        do_normalization = True if normalize_params["normalize"] else False
-        if nimg > 1 and do_normalization and (stitch_threshold or do_3D):
-            # must normalize in 3D if do_3D is True
-            normalize_params["norm3D"] = True if do_3D else normalize_params["norm3D"]
-            x = np.asarray(x)
+        if normalize_params["normalize"]:
             x = transforms.normalize_img(x, **normalize_params)
-            # do not normalize again
-            do_normalization = False
+
+        if rescale != 1.0:
+            x = F.interpolate(x, scale_factor=rescale, mode='bilinear', align_corners=False)
 
         if do_3D:
-            img = np.asarray(x)
-            yf, styles = run_3D(self.net, img, rsz=rescale, anisotropy=anisotropy,
+            yf, styles = run_3D(self.net, x, rsz=rescale, anisotropy=anisotropy,
                                 batch_size=batch_size, augment=augment, tile=tile, 
                                 tile_overlap=tile_overlap)
             cellprob = yf[0][-1] + yf[1][-1] + yf[2][-1]
-            dP = np.stack(
-                (yf[1][0] + yf[2][0], yf[0][0] + yf[2][1], yf[0][1] + yf[1][1]),
-                axis=0)  # (dZ, dY, dX)
+            dP = torch.stack((yf[1][0] + yf[2][0], yf[0][0] + yf[2][1], yf[0][1] + yf[1][1]), dim=0)
             del yf
         else:
-            tqdm_out = utils.TqdmToLogger(models_logger, level=logging.INFO)
-            img = np.asarray(x)
-            if do_normalization:
-                img = transforms.normalize_img(img, **normalize_params)
-            if rescale != 1.0:
-                img = transforms.resize_image(img, rsz=rescale)
-            yf, style = run_net(self.net, img, bsize=bsize, augment=augment,
-                                batch_size=batch_size, tile=tile, 
-                                tile_overlap=tile_overlap)
+            yf, styles = run_net(self.net, x, bsize=bsize, augment=augment,
+                                 batch_size=batch_size, tile=tile, 
+                                 tile_overlap=tile_overlap)
             if resample:
-                yf = transforms.resize_image(yf, shape[1], shape[2])
-            dP = np.moveaxis(yf[..., :2], source=-1, destination=0).copy()
-            cellprob = yf[..., 2]
-            styles = style
-            del yf, style
-        styles = styles.squeeze()
-
-        net_time = time.time() - tic
-        if nimg > 1:
-            models_logger.info("network run in %2.2fs" % (net_time))
+                yf = F.interpolate(yf, size=(x.shape[2], x.shape[3]), mode='bilinear', align_corners=False)
+            dP = yf[:, :2].permute(1, 0, 2, 3)
+            cellprob = yf[:, 2]
 
         if compute_masks:
-            tic = time.time()
-            niter0 = 200 if (do_3D and not resample) else (1 / rescale * 200)
-            niter = niter0 if niter is None or niter == 0 else niter
-            if do_3D:
-                masks, p = dynamics.resize_and_compute_masks(
-                    dP, cellprob, niter=niter, cellprob_threshold=cellprob_threshold,
-                    flow_threshold=flow_threshold, interp=interp, do_3D=do_3D,
-                    min_size=min_size, max_size_fraction=max_size_fraction, resize=None,
-                    device=self.device if self.gpu else None)
-            else:
-                masks, p = [], []
-                resize = [shape[1], shape[2]] if (not resample and
-                                                  rescale != 1) else None
-                iterator = trange(nimg, file=tqdm_out,
-                                  mininterval=30) if nimg > 1 else range(nimg)
-                for i in iterator:
-                    outputs = dynamics.resize_and_compute_masks(
-                        dP[:, i],
-                        cellprob[i],
-                        niter=niter,
-                        cellprob_threshold=cellprob_threshold,
-                        flow_threshold=flow_threshold,
-                        interp=interp,
-                        resize=resize,
-                        min_size=min_size if stitch_threshold == 0 or nimg == 1 else
-                        -1,  # turn off for 3D stitching
-                        max_size_fraction=max_size_fraction,
-                        device=self.device if self.gpu else None)
-                    masks.append(outputs[0])
-                    p.append(outputs[1])
-
-                masks = np.array(masks)
-                p = np.array(p)
-                if stitch_threshold > 0 and nimg > 1:
-                    models_logger.info(
-                        f"stitching {nimg} planes using stitch_threshold={stitch_threshold:0.3f} to make 3D masks"
-                    )
-                    masks = utils.stitch3D(masks, stitch_threshold=stitch_threshold)
-                    masks = utils.fill_holes_and_remove_small_masks(
-                        masks, min_size=min_size)
-                elif nimg > 1:
-                    models_logger.warning(
-                        "3D stack used, but stitch_threshold=0 and do_3D=False, so masks are made per plane only"
-                    )
-
-            flow_time = time.time() - tic
-            if nimg > 1:
-                models_logger.info("masks created in %2.2fs" % (flow_time))
-            masks, dP, cellprob, p = masks.squeeze(), dP.squeeze(), cellprob.squeeze(
-            ), p.squeeze()
-
+            masks, p = dynamics.compute_masks(
+                dP, cellprob, niter=niter, cellprob_threshold=cellprob_threshold,
+                flow_threshold=flow_threshold, interp=interp, do_3D=do_3D,
+                min_size=min_size, max_size_fraction=max_size_fraction,
+                device=self.device)
+            
+            if stitch_threshold > 0 and x.shape[0] > 1:
+                masks = utils.stitch3D(masks, stitch_threshold=stitch_threshold)
+                masks = utils.fill_holes_and_remove_small_masks(masks, min_size=min_size)
         else:
-            masks, p = np.zeros(0), np.zeros(0)  #pass back zeros if not compute_masks
+            masks, p = torch.zeros(0), torch.zeros(0)
+
         return masks, styles, dP, cellprob, p
 
 

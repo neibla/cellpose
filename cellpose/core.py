@@ -194,7 +194,7 @@ def _forward(net, x):
     style = _from_device(style)
     return y, style
 
-
+@torch.jit.script
 def run_net(net, imgs, batch_size=8, augment=False, tile=True, tile_overlap=0.1,
             bsize=224):
     """ 
