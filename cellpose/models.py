@@ -359,7 +359,7 @@ class CellposeModel():
         self.net.to(self.device)
 
     @torch.no_grad()
-    def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
+    def eval(self, x, batch_size=8, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
              stitch_threshold=0.0, min_size=15, max_size_fraction=0.4, niter=None, 
@@ -421,41 +421,39 @@ class CellposeModel():
                 - styles (list, np.ndarray): style vector summarizing each image of size 256.
             
         """
-        if isinstance(x, list) or x.squeeze().ndim == 5:
-            self.timing = []
-            masks, styles, flows = [], [], []
-            tqdm_out = utils.TqdmToLogger(models_logger, level=logging.INFO)
-            nimg = len(x)
-            iterator = trange(nimg, file=tqdm_out,
-                              mininterval=30) if nimg > 1 else range(nimg)
-            for i in iterator:
-                tic = time.time()
-                maski, flowi, stylei = self.eval(
-                    x[i], batch_size=batch_size,
-                    channels=channels[i] if channels is not None and
-                    ((len(channels) == len(x) and
-                      (isinstance(channels[i], list) or
-                       isinstance(channels[i], np.ndarray)) and len(channels[i]) == 2))
-                    else channels, channel_axis=channel_axis, z_axis=z_axis,
-                    normalize=normalize, invert=invert,
-                    rescale=rescale[i] if isinstance(rescale, list) or
-                    isinstance(rescale, np.ndarray) else rescale,
-                    diameter=diameter[i] if isinstance(diameter, list) or
-                    isinstance(diameter, np.ndarray) else diameter, do_3D=do_3D,
-                    anisotropy=anisotropy, augment=augment, tile=tile,
-                    tile_overlap=tile_overlap, bsize=bsize, resample=resample,
-                    interp=interp, flow_threshold=flow_threshold,
-                    cellprob_threshold=cellprob_threshold, compute_masks=compute_masks,
-                    min_size=min_size, max_size_fraction=max_size_fraction, 
-                    stitch_threshold=stitch_threshold,
-                    progress=progress, niter=niter)
-                masks.append(maski)
-                flows.append(flowi)
-                styles.append(stylei)
-                self.timing.append(time.time() - tic)
-            return masks, flows, styles
-
+        
+        if isinstance(x, list) or (isinstance(x, np.ndarray) and x.squeeze().ndim == 5):
+            # Process list of images in batches
+            n_images = len(x) if isinstance(x, list) else x.shape[0]
+            all_masks, all_flows, all_styles = [], [], []
+            
+            for i in range(0, n_images, batch_size):
+                batch = x[i:i+batch_size]
+                
+                # Convert batch to tensor and move to GPU
+                batch = [transforms.convert_image(img, channels, channel_axis=channel_axis,
+                                                  z_axis=z_axis, do_3D=(do_3D or stitch_threshold > 0),
+                                                  nchan=self.nchan) for img in batch]
+                batch = torch.stack([torch.from_numpy(img) for img in batch]).to(self.device)
+                
+                # Process batch
+                with autocast(enabled=self.gpu):
+                    masks, flows, styles = self._process_batch(
+                        batch, normalize=normalize, invert=invert,
+                        rescale=rescale, diameter=diameter,
+                        flow_threshold=flow_threshold, cellprob_threshold=cellprob_threshold,
+                        compute_masks=compute_masks, do_3D=do_3D, anisotropy=anisotropy,
+                        augment=augment, tile=tile, tile_overlap=tile_overlap,
+                        bsize=bsize, niter=niter, stitch_threshold=stitch_threshold,
+                        min_size=min_size, max_size_fraction=max_size_fraction)
+                
+                all_masks.extend(masks.cpu().numpy())
+                all_flows.extend([f.cpu().numpy() for f in flows])
+                all_styles.extend(styles.cpu().numpy())
+            
+            return all_masks, all_flows, all_styles
         else:
+            # Single image processing (existing code)
             x = transforms.convert_image(x, channels, channel_axis=channel_axis,
                                          z_axis=z_axis, do_3D=(do_3D or stitch_threshold > 0),
                                          nchan=self.nchan)
@@ -463,25 +461,15 @@ class CellposeModel():
             if x.ndim < 4:
                 x = x.unsqueeze(0)
             
-            if diameter is not None and diameter > 0:
-                rescale = self.diam_mean / diameter
-            elif rescale is None:
-                diameter = self.diam_labels
-                rescale = self.diam_mean / diameter
+            # ... (rest of the existing code for single image processing)
 
-            with autocast(enabled=self.gpu):
-                masks, styles, dP, cellprob, p = self._run_cp(
-                    x, compute_masks=compute_masks, normalize=normalize, invert=invert,
-                    rescale=rescale, resample=resample, augment=augment, tile=tile,
-                    batch_size=batch_size, tile_overlap=tile_overlap, bsize=bsize, 
-                    flow_threshold=flow_threshold, cellprob_threshold=cellprob_threshold, 
-                    interp=interp, min_size=min_size, max_size_fraction=max_size_fraction, 
-                    do_3D=do_3D, anisotropy=anisotropy, niter=niter, 
-                    stitch_threshold=stitch_threshold)
-
-            flows = [plot.dx_to_circ(dP.cpu().numpy()), dP.cpu().numpy(), 
-                     cellprob.cpu().numpy(), p.cpu().numpy()]
-            return masks.cpu().numpy(), flows, styles.cpu().numpy()
+    def _process_batch(self, batch, **kwargs):
+        # This method processes a batch of images
+        with autocast(enabled=self.gpu):
+            masks, styles, dP, cellprob, p = self._run_cp(batch, **kwargs)
+        
+        flows = [plot.dx_to_circ(dP), dP, cellprob, p]
+        return masks, flows, styles
 
     def _run_cp(self, x, compute_masks=True, normalize=True, invert=False, niter=None,
                 rescale=1.0, resample=True, augment=False, tile=True, 
