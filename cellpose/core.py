@@ -16,6 +16,7 @@ from . import transforms, dynamics, utils, plot, metrics, resnet_torch
 import torch
 from torch import nn
 from torch.utils import mkldnn as mkldnn_utils
+from torch import autocast
 
 TORCH_ENABLED = True
 
@@ -188,7 +189,8 @@ def _forward(net, x):
     if net.mkldnn:
         net = mkldnn_utils.to_mkldnn(net)
     with torch.no_grad():
-        y, style = net(X)[:2]
+        with autocast(enabled=getattr(net, 'use_mixed_precision', False)):
+            y, style = net(X)[:2]
     del X
     y = _from_device(y)
     style = _from_device(style)
@@ -245,7 +247,8 @@ def run_net(net, imgs, batch_size=8, augment=False, tile=True, tile_overlap=0.1,
                               batch_size=batch_size, tile_overlap=tile_overlap)
     else:
         imgs = np.expand_dims(imgs, axis=0)
-        y, style = _forward(net, imgs)
+        with autocast(enabled=getattr(net, 'use_mixed_precision', False)):
+            y, style = _forward(net, imgs)
         y, style = y[0], style[0]
     style /= (style**2).sum()**0.5
 
@@ -312,7 +315,8 @@ def _run_tiled(net, imgi, batch_size=8, augment=False, bsize=224, tile_overlap=0
                         tile_overlap=tile_overlap)
                     IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG, 
                                                     (ny * nx, nchan, ly, lx))
-                ya, stylea = _forward(net, IMGa)
+                with autocast(enabled=getattr(net, 'use_mixed_precision', False)):
+                    ya, stylea = _forward(net, IMGa)
                 for i, b in enumerate(inds):
                     y = ya[i * ntiles : (i + 1) * ntiles]
                     if augment:
@@ -398,8 +402,9 @@ def run_3D(net, imgs, batch_size=8, rsz=1.0, anisotropy=None, augment=False, til
         # per image
         core_logger.info("running %s: %d planes of size (%d, %d)" %
                          (sstr[p], shape[0], shape[1], shape[2]))
-        y, style = run_net(net, xsl, batch_size=batch_size, augment=augment, tile=tile,
-                           bsize=bsize, tile_overlap=tile_overlap)
+        with autocast(enabled=getattr(net, 'use_mixed_precision', False)):
+            y, style = run_net(net, xsl, batch_size=batch_size, augment=augment, tile=tile,
+                               bsize=bsize, tile_overlap=tile_overlap)
         y = transforms.resize_image(y, shape[1], shape[2])
         yf[p] = y.transpose(ipm[p])
         if progress is not None:

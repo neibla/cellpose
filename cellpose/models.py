@@ -8,13 +8,14 @@ import numpy as np
 from tqdm import trange, tqdm
 from urllib.parse import urlparse
 import torch
-from torch.cuda.amp import autocast
+from torch import autocast
 from torch.nn.parallel import DataParallel
 import torch.nn.functional as F
 
 import logging
 
 models_logger = logging.getLogger(__name__)
+
 
 from . import transforms, dynamics, utils, plot
 from .resnet_torch import CPnet
