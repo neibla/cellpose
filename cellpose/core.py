@@ -182,6 +182,9 @@ def _forward(net, x):
         net = mkldnn_utils.to_mkldnn(net)
     with torch.no_grad():
         with autocast(device_type=net.device.type):
+            is_half_precision = next(net.parameters()).dtype == torch.float16
+            if is_half_precision:
+                X = X.half()
             y, style = net(X)[:2]
     del X
     y = _from_device(y)
