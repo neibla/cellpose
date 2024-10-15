@@ -350,8 +350,6 @@ class CellposeModel():
 
         self.net_type = f"cellpose_{backbone}"
 
-        self.net = torch.jit.script(self.net)  # JIT compile the model
-
         self.net.to(self.device)
 
         # Enable cuDNN benchmarking for faster convolutions
