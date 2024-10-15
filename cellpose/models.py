@@ -350,6 +350,17 @@ class CellposeModel():
 
         self.net_type = f"cellpose_{backbone}"
 
+        self.net = torch.jit.script(self.net)  # JIT compile the model
+
+        self.net.to(self.device)
+
+        # Enable cuDNN benchmarking for faster convolutions
+        if self.gpu:
+            torch.backends.cudnn.benchmark = True
+        
+        # Set the model to evaluation mode
+        self.net.eval()
+
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
@@ -470,7 +481,7 @@ class CellposeModel():
                 stitch_threshold=stitch_threshold)
 
             flows = [plot.dx_to_circ(dP), dP, cellprob, p]
-            return masks, flows, styles
+            return masks, torch.zeros(0), styles
 
     def _run_cp(self, x, compute_masks=True, normalize=True, invert=False, niter=None,
                 rescale=1.0, resample=True, augment=False, tile=True, 
@@ -640,7 +651,11 @@ class SizeModel():
             error_message = "no pretrained cellpose model specified, cannot compute size"
             models_logger.critical(error_message)
             raise ValueError(error_message)
-
+        self.net.to(self.device)
+        if self.gpu:
+            torch.backends.cudnn.benchmark = True
+        # Set the model to evaluation mode
+        self.net.eval()
     def eval(self, x, channels=None, channel_axis=None, normalize=True, invert=False,
              augment=False, tile=True, batch_size=8, progress=None):
         """Use images x to produce style or use style input to predict size of objects in image.
