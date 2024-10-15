@@ -2,13 +2,12 @@
 Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
 """
 
-import os, sys, time, shutil, tempfile, datetime, pathlib, subprocess
+import os, time, pathlib
 from pathlib import Path
 import numpy as np
-from tqdm import trange, tqdm
-from urllib.parse import urlparse
+from tqdm import trange
 import torch
-
+from torch import autocast
 import logging
 
 models_logger = logging.getLogger(__name__)
@@ -236,7 +235,8 @@ class CellposeModel():
     """
 
     def __init__(self, gpu=False, pretrained_model=False, model_type=None,
-                 mkldnn=True, diam_mean=30., device=None, nchan=2, backbone="default"):
+                 mkldnn=True, diam_mean=30., device=None, nchan=2, backbone="default",
+                 use_mixed_precision=False):  # Add use_mixed_precision parameter
         """
         Initialize the CellposeModel.
 
@@ -358,6 +358,8 @@ class CellposeModel():
         
         # Set the model to evaluation mode
         self.net.eval()
+
+        self.use_mixed_precision = use_mixed_precision
 
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
@@ -515,9 +517,10 @@ class CellposeModel():
 
         if do_3D:
             img = np.asarray(x)
-            yf, styles = run_3D(self.net, img, rsz=rescale, anisotropy=anisotropy,
-                                batch_size=batch_size, augment=augment, tile=tile, 
-                                tile_overlap=tile_overlap)
+            with autocast(enabled=self.device):
+                yf, styles = run_3D(self.net, img, rsz=rescale, anisotropy=anisotropy,
+                                    batch_size=batch_size, augment=augment, tile=tile, 
+                                    tile_overlap=tile_overlap)
             cellprob = yf[0][-1] + yf[1][-1] + yf[2][-1]
             dP = np.stack(
                 (yf[1][0] + yf[2][0], yf[0][0] + yf[2][1], yf[0][1] + yf[1][1]),
@@ -530,9 +533,10 @@ class CellposeModel():
                 img = transforms.normalize_img(img, **normalize_params)
             if rescale != 1.0:
                 img = transforms.resize_image(img, rsz=rescale)
-            yf, style = run_net(self.net, img, bsize=bsize, augment=augment,
-                                batch_size=batch_size, tile=tile, 
-                                tile_overlap=tile_overlap)
+            with autocast(enabled=self.device):
+                yf, style = run_net(self.net, img, bsize=bsize, augment=augment,
+                                    batch_size=batch_size, tile=tile, 
+                                    tile_overlap=tile_overlap)
             if resample:
                 yf = transforms.resize_image(yf, shape[1], shape[2])
             dP = np.moveaxis(yf[..., :2], source=-1, destination=0).copy()
