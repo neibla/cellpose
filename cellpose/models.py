@@ -517,7 +517,7 @@ class CellposeModel():
 
         if do_3D:
             img = np.asarray(x)
-            with autocast(enabled=self.device):
+            with autocast(device_type=self.device):
                 yf, styles = run_3D(self.net, img, rsz=rescale, anisotropy=anisotropy,
                                     batch_size=batch_size, augment=augment, tile=tile, 
                                     tile_overlap=tile_overlap)
@@ -533,7 +533,7 @@ class CellposeModel():
                 img = transforms.normalize_img(img, **normalize_params)
             if rescale != 1.0:
                 img = transforms.resize_image(img, rsz=rescale)
-            with autocast(enabled=self.device):
+            with autocast(device_type=self.device):
                 yf, style = run_net(self.net, img, bsize=bsize, augment=augment,
                                     batch_size=batch_size, tile=tile, 
                                     tile_overlap=tile_overlap)
