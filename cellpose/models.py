@@ -358,6 +358,13 @@ class CellposeModel():
             self.net = DataParallel(self.net)
         self.net.to(self.device)
 
+        # Enable cuDNN benchmarking for faster convolutions
+        if self.gpu:
+            torch.backends.cudnn.benchmark = True
+        
+        # Set the model to evaluation mode
+        self.net.eval()
+
     @torch.no_grad()
     def eval(self, x, batch_size=8, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
@@ -468,8 +475,8 @@ class CellposeModel():
         with autocast(enabled=self.gpu):
             masks, styles, dP, cellprob, p = self._run_cp(batch, **kwargs)
         
-        flows = [plot.dx_to_circ(dP), dP, cellprob, p]
-        return masks, flows, styles
+        # flows = [plot.dx_to_circ(dP), dP, cellprob, p]
+        return masks, torch.zeros(0), styles
 
     def _run_cp(self, x, compute_masks=True, normalize=True, invert=False, niter=None,
                 rescale=1.0, resample=True, augment=False, tile=True, 
