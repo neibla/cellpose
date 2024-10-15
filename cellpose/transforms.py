@@ -4,7 +4,9 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 
 import logging
 import warnings
-
+import numpy as np
+import cv2
+from scipy.ndimage import zoom
 import cv2
 import numpy as np
 import torch
@@ -219,6 +221,7 @@ def normalize99_tile(img, blocksize=100, lower=1., upper=99., tile_overlap=0.1,
         (1. + 2 * tile_overlap) * Lx / blocksize))
     ystart = np.linspace(0, Ly - blocksizeY, ny).astype(int)
     xstart = np.linspace(0, Lx - blocksizeX, nx).astype(int)
+
     ysub = []
     xsub = []
     for j in range(len(ystart)):
@@ -715,15 +718,7 @@ def normalize_img(img, normalize=True, norm3D=False, invert=False, lowhigh=None,
     return img_norm
 
 def resize_safe(img, Ly, Lx, interpolation=cv2.INTER_LINEAR):
-    """OpenCV resize function does not support uint32.
-
-    This function converts the image to float32 before resizing and then converts it back to uint32. Not safe!
-    References issue: https://github.com/MouseLand/cellpose/issues/937
-
-    Implications:
-    * Runtime: Runtime increases by 5x-50x due to type casting. However, with resizing being very efficient, this is not
-    a big issue. A 10,000x10,000 image takes 0.47s instead of 0.016s to cast and resize on 32 cores on GPU.
-    * Memory: However, memory usage increases. Not tested by how much.
+    """Efficient resizing function that supports various data types.
 
     Args:
         img (ndarray): Image of size [Ly x Lx].
@@ -733,23 +728,29 @@ def resize_safe(img, Ly, Lx, interpolation=cv2.INTER_LINEAR):
 
     Returns:
         ndarray: Resized image of size [Ly x Lx].
-
     """
+    if img.dtype == np.uint32:
+        return resize_uint32(img, Ly, Lx)
+    elif img.dtype == np.float32:
+        return cv2.resize(img, (Lx, Ly), interpolation=interpolation)
+    else:
+        # For other dtypes, use NumPy's built-in interpolation
+        return resize_numpy(img, Ly, Lx)
 
-    # cast image
-    cast = img.dtype == np.uint32
-    if cast:
-        img = img.astype(np.float32)
+def resize_uint32(img, Ly, Lx):
+    """Resize uint32 images using NumPy's built-in interpolation."""
+    zoom_y = Ly / img.shape[0]
+    zoom_x = Lx / img.shape[1]
+    return zoom(img, (zoom_y, zoom_x), order=1, mode='nearest', prefilter=False).astype(np.uint32)
 
-    # resize
-    img = cv2.resize(img, (Lx, Ly), interpolation=interpolation)
+def resize_numpy(img, Ly, Lx):
+    """Resize images using NumPy's built-in interpolation."""
+    zoom_y = Ly / img.shape[0]
+    zoom_x = Lx / img.shape[1]
+    return zoom(img, (zoom_y, zoom_x), order=1, mode='nearest', prefilter=True)
 
-    # cast back
-    if cast:
-        transforms_logger.warning("resizing image from uint32 to float32 and back to uint32")
-        img = img.round().astype(np.uint32)
 
-    return img
+
 
 
 def resize_image(img0, Ly=None, Lx=None, rsz=None, interpolation=cv2.INTER_LINEAR,
